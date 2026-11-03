@@ -1,5 +1,0 @@
-state/*.tmp
-signals_out.json
-__pycache__/
-*.pyc
-.env
