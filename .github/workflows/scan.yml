@@ -1,0 +1,173 @@
+name: TSE Scan & Execute
+
+# Every 30 minutes, Sunday to Friday (incl. nights and Sunday evenings), Saturday skipped (UTC), 2 minutes after each M30 bar closes.
+# A cheap gate decides whether anything can happen (session open, or an open trade to manage)
+# so the expensive steps (install + MT5 terminal) are skipped the rest of the time.
+on:
+  schedule:
+    - cron: "2,32 * * * 0-5"
+  workflow_dispatch:
+    inputs:
+      force_scan:
+        description: "Kept for manual runs (no effect now that there is no session filter)"
+        required: false
+        default: "false"
+
+# one run at a time: they share the broker account and the state files
+concurrency:
+  group: tse-scan-execute
+  cancel-in-progress: false
+
+# needed so the "Save state" step can commit state/ back to the repo
+permissions:
+  contents: write
+
+jobs:
+  scan-and-execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Broker-side order execution is always on (hard-coded; no input or variable can change it).
+      # The executor refuses any account that is not DEMO (trade_mode 0) or REAL (trade_mode 2).
+      DRY_RUN: 'false'
+      KB_FORCE_SCAN: ${{ github.event.inputs.force_scan || 'false' }}
+      KB_STATE_DIR: state
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate (is anything possible right now?)
+        id: gate
+        run: python3 session_gate.py
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.active == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        if: steps.gate.outputs.active == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Start MT5 bridge
+        if: steps.gate.outputs.active == 'true'
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+          API_KEY: ${{ secrets.MT5_API_KEY }}
+          STARTUP_SYMBOL: EURUSD${{ vars.KB_SYMBOL_SUFFIX || '' }}
+        run: |
+          # Validate the API-key secret without printing its contents.
+          python - <<'PY'
+          import os, sys
+          key = os.environ.get("API_KEY", "")
+          clean = key.strip()
+          print(f"API_KEY diagnostic: present={bool(clean)}, length={len(clean)}, numeric_only={clean.isdigit()}, has_linebreak={chr(10) in key or chr(13) in key}, has_edge_whitespace={key != clean}")
+          if not clean or "\n" in clean or "\r" in clean:
+              print("::error::MT5_API_KEY is empty or contains embedded line breaks; recreate the secret")
+              sys.exit(1)
+          PY
+          # Give the bridge the SAME trimmed key the executor/scanner send (they strip it too);
+          # a stray space/newline in the secret otherwise makes the bridge answer 403.
+          API_KEY="$(printf '%s' "$API_KEY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          export API_KEY
+          # Bound to localhost only. Once tested, pin the image to a digest instead of :latest.
+          docker run -d --name mt5bridge -p 127.0.0.1:5000:5000 \
+            -e MT5_LOGIN -e MT5_PASSWORD -e MT5_SERVER -e API_KEY \
+            -e MT5_STARTUP_SYMBOL="$STARTUP_SYMBOL" \
+            -e MT5_STARTUP_PERIOD=M30 \
+            -e MT5_STARTUP_TIMEOUT=180 \
+            liberatti/mt5bridge:latest >/dev/null
+
+      - name: Wait until the terminal is connected to the broker
+        if: steps.gate.outputs.active == 'true'
+        env:
+          API_KEY: ${{ secrets.MT5_API_KEY }}
+          MT5_API_URL: http://127.0.0.1:5000/api
+          READY_TIMEOUT: "600"
+        run: python mt5_execute.py --wait
+
+      - name: Scan (51 BEST strategies -> Telegram + executor signals)
+        id: scan
+        if: steps.gate.outputs.active == 'true'
+        env:
+          API_KEY: ${{ secrets.MT5_API_KEY }}
+          MT5_API_URL: http://127.0.0.1:5000/api
+          SYMBOL_SUFFIX: ${{ vars.KB_SYMBOL_SUFFIX || '' }}
+          KB_PAIRS: ${{ vars.KB_PAIRS || 'XAUUSD,EURUSD,GBPUSD,USDJPY,AUDUSD' }}
+          KB_EXEC_PAIRS: ${{ vars.KB_EXEC_PAIRS || 'EURUSD' }}
+          KB_DESIGNS: ${{ vars.KB_DESIGNS || 'A,B' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scan_once.py
+
+      # Runs even when the scan step failed (e.g. one pair had no data): open trades must still be
+      # managed and signals from the pairs that did scan must still be executed. The job stays red.
+      - name: Execute / manage open trades
+        if: ${{ always() && steps.gate.outputs.active == 'true' && (steps.scan.conclusion == 'success' || steps.scan.conclusion == 'failure') }}
+        env:
+          API_KEY: ${{ secrets.MT5_API_KEY }}
+          MT5_API_URL: http://127.0.0.1:5000/api
+          SYMBOL_SUFFIX: ${{ vars.KB_SYMBOL_SUFFIX || '' }}
+          KB_RISK_PERCENT: ${{ vars.KB_RISK_PERCENT || '1.0' }}
+          KB_MAX_VOLUME: ${{ vars.KB_MAX_VOLUME || '0.10' }}
+          LOT_SIZE: ${{ vars.KB_LOT_SIZE || '' }}
+          MAX_OPEN: ${{ vars.KB_MAX_OPEN || '4' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python mt5_execute.py
+
+      - name: Save state (ledger, cooldowns, signal/outcome logs)
+        if: always() && steps.gate.outputs.active == 'true'
+        run: |
+          git config user.name "tse-bot"
+          git config user.email "tse-bot@users.noreply.github.com"
+          git add state/ || true
+          if git diff --staged --quiet; then echo "no state changes"; exit 0; fi
+          git commit -m "state: $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin "${GITHUB_REF_NAME}" && git push && exit 0
+            sleep 5
+          done
+          echo "::error::could not push state after 3 tries; the trade ledger was NOT saved"
+          exit 1
+
+      # Container logs can contain your account number. Print them only if you turn debugging on.
+      - name: Container logs (debug only)
+        if: failure() && vars.KB_DEBUG_LOGS == 'true'
+        env:
+          API_KEY: ${{ secrets.MT5_API_KEY }}
+        run: |
+          K="$(printf '%s' "$API_KEY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          docker ps -a --filter name=mt5bridge --format 'container: {{.Status}}' || true
+          echo "--- from the runner to the bridge (HTTP status only):"
+          curl -sS -m 20 -o /dev/null -w "runner->bridge HTTP %{http_code}\n" -H "x-api-key: $K" http://127.0.0.1:5000/api/terminal_info 2>&1 || true
+          echo "--- from inside the container (HTTP status only):"
+          docker exec -e K="$K" mt5bridge sh -c 'curl -sS -m 20 -o /dev/null -w "inside HTTP %{http_code}\n" -H "x-api-key: $K" http://127.0.0.1:5000/api/terminal_info' 2>&1 | tail -3 || true
+          echo "--- listening ports inside the container:"
+          docker exec mt5bridge sh -c 'ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null' 2>&1 | head -12 || true
+          echo "--- last 25 container log lines (ASCII only):"
+          docker logs --tail 25 mt5bridge 2>&1 | tr -cd '\11\12\40-\176' | cut -c1-220 || true
+          echo "--- lines about login / errors / workers:"
+          docker logs mt5bridge 2>&1 | tr -cd '\11\12\40-\176' | grep -aiE "login|authoriz|connect|error|fail|invalid|timeout|worker|gunicorn|werkzeug|traceback|running on|account|server" | tail -30 || true
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # curl exit 3 = malformed URL: the token secret has a stray space/newline. Trim it, and never let
+          # the alert itself hide the real failure.
+          TG_TOKEN="$(printf '%s' "$TG_TOKEN" | tr -d '[:space:]')"
+          TG_CHAT="$(printf '%s' "$TG_CHAT" | tr -d '[:space:]')"
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -sS --fail "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" -d chat_id="$TG_CHAT" \
+              --data-urlencode "text=TSE run FAILED. Check the MT5 account manually: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null \
+              || echo "::warning::Telegram alert not delivered; re-create TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID"
+          fi
+
+      - name: Stop bridge
+        if: always() && steps.gate.outputs.active == 'true'
+        run: docker rm -f mt5bridge || true
